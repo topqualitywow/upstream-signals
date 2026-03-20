@@ -18,14 +18,17 @@ app.use(express.json());
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 
-// ── Parse signal with Claude ──────────────────────────────────────────────────
+function parseJSON(text) {
+  return JSON.parse(text.replace(/```json|```/g, '').trim());
+}
+
 app.post('/api/parse-signal', async (req, res) => {
   const { raw } = req.body;
   try {
     const msg = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1000,
-      system: `You are a cultural and market signal analyst. Given a freeform upstream signal observation, extract structured data. Return ONLY valid JSON, no markdown, no preamble.
+      system: `You are a cultural and market signal analyst. Given a freeform upstream signal observation, extract structured data. Return ONLY valid JSON, no markdown, no preamble, no backticks.
 
 Schema:
 {
@@ -40,7 +43,7 @@ Schema:
       messages: [{ role: 'user', content: raw }]
     });
 
-    const parsed = JSON.parse(msg.content[0].text);
+    const parsed = parseJSON(msg.content[0].text);
     res.json({ success: true, parsed });
   } catch (e) {
     console.error(e);
@@ -48,7 +51,6 @@ Schema:
   }
 });
 
-// ── Google Trends via unofficial proxy ───────────────────────────────────────
 app.post('/api/trends', async (req, res) => {
   const { keywords } = req.body;
   try {
@@ -60,12 +62,7 @@ app.post('/api/trends', async (req, res) => {
           category: 0,
           property: ''
         }))}&tz=-300`;
-
-        const r = await axios.get(url, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          timeout: 8000
-        });
-
+        const r = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
         const clean = r.data.replace(/^\)\]\}'\\n/, '').replace(/^\)\]\}'\n/, '');
         results[kw] = { raw: clean.slice(0, 500), status: 'ok' };
       } catch {
@@ -78,12 +75,10 @@ app.post('/api/trends', async (req, res) => {
   }
 });
 
-// ── Reddit search ─────────────────────────────────────────────────────────────
 app.post('/api/reddit', async (req, res) => {
   const { keywords, subreddits } = req.body;
   try {
     const posts = [];
-
     for (const kw of keywords.slice(0, 2)) {
       try {
         const r = await axios.get(`https://www.reddit.com/search.json`, {
@@ -92,52 +87,35 @@ app.post('/api/reddit', async (req, res) => {
           timeout: 8000
         });
         const items = r.data?.data?.children?.map(c => ({
-          title: c.data.title,
-          subreddit: c.data.subreddit,
-          score: c.data.score,
-          comments: c.data.num_comments,
-          url: `https://reddit.com${c.data.permalink}`,
-          created: new Date(c.data.created_utc * 1000).toISOString(),
-          keyword: kw
+          title: c.data.title, subreddit: c.data.subreddit, score: c.data.score,
+          comments: c.data.num_comments, url: `https://reddit.com${c.data.permalink}`,
+          created: new Date(c.data.created_utc * 1000).toISOString(), keyword: kw
         })) || [];
         posts.push(...items);
       } catch { }
     }
-
     for (const sub of subreddits.slice(0, 2)) {
       try {
         const r = await axios.get(`https://www.reddit.com/r/${sub}/search.json`, {
           params: { q: keywords[0], sort: 'new', limit: 5, restrict_sr: true },
-          headers: { 'User-Agent': 'SignalApp/1.0' },
-          timeout: 8000
+          headers: { 'User-Agent': 'SignalApp/1.0' }, timeout: 8000
         });
         const items = r.data?.data?.children?.map(c => ({
-          title: c.data.title,
-          subreddit: c.data.subreddit,
-          score: c.data.score,
-          comments: c.data.num_comments,
-          url: `https://reddit.com${c.data.permalink}`,
-          created: new Date(c.data.created_utc * 1000).toISOString(),
-          targeted: true
+          title: c.data.title, subreddit: c.data.subreddit, score: c.data.score,
+          comments: c.data.num_comments, url: `https://reddit.com${c.data.permalink}`,
+          created: new Date(c.data.created_utc * 1000).toISOString(), targeted: true
         })) || [];
         posts.push(...items);
       } catch { }
     }
-
     const seen = new Set();
-    const deduped = posts.filter(p => {
-      if (seen.has(p.title)) return false;
-      seen.add(p.title);
-      return true;
-    });
-
+    const deduped = posts.filter(p => { if (seen.has(p.title)) return false; seen.add(p.title); return true; });
     res.json({ success: true, posts: deduped.slice(0, 20) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── Synthesize analysis with Claude ──────────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
   const { signal, redditPosts, trendsData } = req.body;
   try {
@@ -152,34 +130,34 @@ ${JSON.stringify(redditPosts?.slice(0, 15), null, 2)}
 GOOGLE TRENDS DATA:
 ${JSON.stringify(trendsData, null, 2)}
 
-Analyze the downstream data against this upstream signal. Return ONLY valid JSON:
+Analyze the downstream data against this upstream signal. Return ONLY valid JSON, no markdown, no backticks:
 
 {
-  "momentum_score": <0-100 integer, how much downstream evidence supports this signal>,
-  "momentum_label": <"Weak" | "Emerging" | "Building" | "Strong">,
+  "momentum_score": 0,
+  "momentum_label": "Weak",
   "cultural_momentum": {
-    "summary": "2-3 sentences on what the Reddit and social data shows",
-    "top_communities": ["subreddit names where this is active"],
-    "engagement_signal": "low | medium | high",
-    "notable_posts": [{"title": "...", "why_notable": "..."}]
+    "summary": "...",
+    "top_communities": [],
+    "engagement_signal": "low",
+    "notable_posts": []
   },
   "search_momentum": {
-    "summary": "what the trends data suggests about search interest",
-    "trend_direction": "rising | stable | declining | insufficient_data"
+    "summary": "...",
+    "trend_direction": "insufficient_data"
   },
-  "upstream_downstream_read": "2-3 sentences on where this signal sits in the causal chain and what it likely predicts",
-  "what_to_watch": ["3-4 specific things to monitor that would confirm or deny this signal is real"],
-  "confidence": "low | medium | high",
-  "confidence_reasoning": "1 sentence on why"
+  "upstream_downstream_read": "...",
+  "what_to_watch": [],
+  "confidence": "low",
+  "confidence_reasoning": "..."
 }`;
 
     const msg = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1000,
       messages: [{ role: 'user', content: prompt }]
     });
 
-    const analysis = JSON.parse(msg.content[0].text);
+    const analysis = parseJSON(msg.content[0].text);
     res.json({ success: true, analysis });
   } catch (e) {
     console.error(e);
@@ -187,7 +165,6 @@ Analyze the downstream data against this upstream signal. Return ONLY valid JSON
   }
 });
 
-// ── Save signal to Supabase ───────────────────────────────────────────────────
 app.post('/api/signals', async (req, res) => {
   const { raw, parsed, analysis } = req.body;
   try {
@@ -202,13 +179,9 @@ app.post('/api/signals', async (req, res) => {
   }
 });
 
-// ── Get all signals ───────────────────────────────────────────────────────────
 app.get('/api/signals', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('signals')
-      .select('*')
-      .order('created_at', { ascending: false });
+    const { data, error } = await supabase.from('signals').select('*').order('created_at', { ascending: false });
     if (error) throw error;
     res.json({ success: true, signals: data });
   } catch (e) {
@@ -216,7 +189,6 @@ app.get('/api/signals', async (req, res) => {
   }
 });
 
-// ── Delete signal ─────────────────────────────────────────────────────────────
 app.delete('/api/signals/:id', async (req, res) => {
   try {
     const { error } = await supabase.from('signals').delete().eq('id', req.params.id);
