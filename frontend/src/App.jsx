@@ -9,12 +9,12 @@ import "./index.css"
 const API = import.meta.env.VITE_API_URL || "http://localhost:8000"
 
 export default function App() {
-  const [step, setStep] = useState("input") // input | config | running | output | history
+  const [step, setStep] = useState("input")
   const [description, setDescription] = useState("")
   const [keywords, setKeywords] = useState([])
   const [trendsData, setTrendsData] = useState({})
   const [redditData, setRedditData] = useState({})
-  const [analysis, setAnalysis] = useState(null)
+  const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
 
   async function handleDescriptionSubmit(desc) {
@@ -45,6 +45,7 @@ export default function App() {
     try {
       const kwBody = { keywords: confirmedKeywords }
 
+      // Fetch Trends + Reddit in parallel
       const [trendsRes, redditRes] = await Promise.all([
         fetch(`${API}/api/trends`, {
           method: "POST",
@@ -60,22 +61,27 @@ export default function App() {
 
       const trends = await trendsRes.json()
       const reddit = await redditRes.json()
+      const td = trends.results || {}
+      const rd = reddit.results || {}
 
-      setTrendsData(trends.results || {})
-      setRedditData(reddit.results || {})
+      setTrendsData(td)
+      setRedditData(rd)
 
+      // Analyze with actual data — AI translates only
       const analysisRes = await fetch(`${API}/api/analyze`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           description,
-          keywords: confirmedKeywords
+          keywords: confirmedKeywords,
+          trends_data: td,
+          reddit_data: rd
         })
       })
 
       const analysisData = await analysisRes.json()
       if (!analysisData.success) throw new Error(analysisData.detail)
-      setAnalysis(analysisData.analysis)
+      setResult(analysisData)
 
       // Save to Supabase
       await fetch(`${API}/api/signals`, {
@@ -84,9 +90,9 @@ export default function App() {
         body: JSON.stringify({
           description,
           keywords: confirmedKeywords,
-          analysis: analysisData.analysis,
-          trends_data: trends.results,
-          reddit_data: reddit.results
+          analysis: analysisData,
+          trends_data: td,
+          reddit_data: rd
         })
       })
 
@@ -103,7 +109,7 @@ export default function App() {
     setKeywords([])
     setTrendsData({})
     setRedditData({})
-    setAnalysis(null)
+    setResult(null)
     setError(null)
   }
 
@@ -135,12 +141,8 @@ export default function App() {
         )}
 
         {(step === "input" || step === "loading-keywords") && (
-          <SignalInput
-            onSubmit={handleDescriptionSubmit}
-            loading={step === "loading-keywords"}
-          />
+          <SignalInput onSubmit={handleDescriptionSubmit} loading={step === "loading-keywords"} />
         )}
-
         {step === "config" && (
           <KeywordConfig
             description={description}
@@ -150,27 +152,22 @@ export default function App() {
             onChange={setKeywords}
           />
         )}
-
-        {step === "running" && (
-          <AnalysisRunning keywords={keywords} />
-        )}
-
-        {step === "output" && analysis && (
+        {step === "running" && <AnalysisRunning keywords={keywords} />}
+        {step === "output" && result && (
           <SignalOutput
             description={description}
             keywords={keywords}
-            analysis={analysis}
+            result={result}
             trendsData={trendsData}
             redditData={redditData}
             onReset={handleReset}
           />
         )}
-
         {step === "history" && (
           <SignalHistory api={API} onSelect={(s) => {
             setDescription(s.raw_input)
             setKeywords(s.parsed?.keywords || [])
-            setAnalysis(s.analysis)
+            setResult(s.analysis)
             setTrendsData(s.trends_data || {})
             setRedditData(s.reddit_data || {})
             setStep("output")
