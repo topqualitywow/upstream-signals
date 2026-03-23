@@ -73,6 +73,7 @@ function KeywordChip({ kw, trendsData }) {
 }
 
 function ScoreBreakdown({ components }) {
+  if (!components) return <div className="score-note">Score components unavailable.</div>
   const labels = {
     trends_velocity: "Trends velocity",
     trends_coverage: "Data coverage",
@@ -103,7 +104,7 @@ function ScoreBreakdown({ components }) {
 }
 
 function CorrelationMatrix({ correlation, keywords }) {
-  if (!correlation?.pairs?.length) return null
+  if (!correlation || !correlation.pairs || !correlation.pairs.length) return null
 
   const topPairs = [...correlation.pairs]
     .sort((a, b) => Math.abs(b.r) - Math.abs(a.r))
@@ -158,6 +159,7 @@ function CorrelationMatrix({ correlation, keywords }) {
 
 export default function SignalOutput({ description, keywords, result, trendsData, redditData, onReset }) {
   const { score, label, score_components, correlation, signal_translation } = result || {}
+  if (!result) return <div className="output-error">No result data available.</div>
   const scoreColor = SCORE_COLORS[label] || "#666"
 
   const chartKeywords = [...keywords.filter(k => k.anchor), ...keywords.filter(k => !k.anchor)].slice(0, 8)
