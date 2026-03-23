@@ -9,6 +9,10 @@ import re
 from pytrends.request import TrendReq
 import time
 import math
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("upstream")
 
 try:
     import praw
@@ -203,6 +207,7 @@ def compute_signal_score(trends_data: dict, reddit_data: dict, keywords: list, c
 
 @app.post("/api/generate-keywords")
 async def generate_keywords(body: SignalInput):
+    logger.info(f"[keywords] Generating keywords for: {body.description[:80]}...")
     try:
         msg = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -236,8 +241,10 @@ Return ONLY valid JSON, no markdown:
             messages=[{"role": "user", "content": body.description}]
         )
         data = parse_json(msg.content[0].text)
+        logger.info(f"[keywords] Generated {len(data['keywords'])} keywords")
         return {"success": True, "keywords": data["keywords"]}
     except Exception as e:
+        logger.error(f"[keywords] Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Step 2: Google Trends ──────────────────────────────────────────────────────
@@ -247,47 +254,66 @@ async def get_trends(body: KeywordCluster):
     results = {}
     terms = [k.term for k in body.keywords]
     batches = [terms[i:i+5] for i in range(0, len(terms), 5)]
+    logger.info(f"[trends] Starting fetch for {len(terms)} keywords in {len(batches[:4])} batches")
 
     try:
         pytrends = TrendReq(hl='en-US', tz=360, timeout=(10, 25))
 
-        for batch in batches[:4]:
-            try:
-                pytrends.build_payload(batch, timeframe='today 3-m', geo='')
-                interest = pytrends.interest_over_time()
+        for batch_idx, batch in enumerate(batches[:4]):
+            logger.info(f"[trends] Batch {batch_idx + 1}/{len(batches[:4])}: {batch}")
+            attempt = 0
+            max_attempts = 2
+            while attempt < max_attempts:
+                try:
+                    pytrends.build_payload(batch, timeframe='today 3-m', geo='')
+                    interest = pytrends.interest_over_time()
 
-                if not interest.empty:
-                    for term in batch:
-                        if term in interest.columns:
-                            series = interest[term].tolist()
-                            dates = [str(d)[:10] for d in interest.index.tolist()]
-                            avg = sum(series) / len(series) if series else 0
-                            recent = sum(series[-4:]) / 4 if len(series) >= 4 else avg
-                            older = sum(series[-12:-4]) / 8 if len(series) >= 12 else avg
-                            velocity = ((recent - older) / older * 100) if older > 0 else 0
-                            results[term] = {
-                                "series": series,
-                                "dates": dates,
-                                "avg": round(avg, 1),
-                                "recent_avg": round(recent, 1),
-                                "velocity": round(velocity, 1),
-                                "status": "ok"
-                            }
-                        else:
+                    if not interest.empty:
+                        for term in batch:
+                            if term in interest.columns:
+                                series = interest[term].tolist()
+                                dates = [str(d)[:10] for d in interest.index.tolist()]
+                                avg = sum(series) / len(series) if series else 0
+                                recent = sum(series[-4:]) / 4 if len(series) >= 4 else avg
+                                older = sum(series[-12:-4]) / 8 if len(series) >= 12 else avg
+                                velocity = ((recent - older) / older * 100) if older > 0 else 0
+                                results[term] = {
+                                    "series": series,
+                                    "dates": dates,
+                                    "avg": round(avg, 1),
+                                    "recent_avg": round(recent, 1),
+                                    "velocity": round(velocity, 1),
+                                    "status": "ok"
+                                }
+                            else:
+                                logger.warning(f"[trends] No data for term: {term}")
+                                results[term] = {"status": "no_data"}
+                    else:
+                        logger.warning(f"[trends] Batch {batch_idx + 1} returned empty — no data for: {batch}")
+                        for term in batch:
                             results[term] = {"status": "no_data"}
-                else:
+
+                    break  # success, exit retry loop
+
+                except Exception as e:
+                    if "429" in str(e) and attempt == 0:
+                        logger.warning(f"[trends] Rate limited (429) on batch {batch_idx + 1}, retrying in 5s...")
+                        time.sleep(5)
+                        attempt += 1
+                        continue
+                    logger.error(f"[trends] Batch {batch_idx + 1} failed: {e}")
                     for term in batch:
-                        results[term] = {"status": "no_data"}
+                        results[term] = {"status": "error", "detail": str(e)}
+                    break
 
-                time.sleep(1)
+            time.sleep(2)
 
-            except Exception as e:
-                for term in batch:
-                    results[term] = {"status": "error", "detail": str(e)}
-
+        ok_count = sum(1 for v in results.values() if v.get("status") == "ok")
+        logger.info(f"[trends] Done — {ok_count}/{len(terms)} keywords returned data")
         return {"success": True, "results": results}
 
     except Exception as e:
+        logger.error(f"[trends] Fatal error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Step 3: Reddit ─────────────────────────────────────────────────────────────
@@ -295,9 +321,11 @@ async def get_trends(body: KeywordCluster):
 @app.post("/api/reddit")
 async def get_reddit(body: KeywordCluster):
     if not REDDIT_ENABLED or reddit is None:
+        logger.info("[reddit] Reddit integration disabled — skipping")
         return {"success": True, "results": {}, "disabled": True}
 
     results = {}
+    logger.info(f"[reddit] Searching {min(len(body.keywords), 12)} keywords")
     for kw in body.keywords[:12]:
         try:
             recent_posts = list(reddit.subreddit("all").search(
@@ -321,17 +349,22 @@ async def get_reddit(body: KeywordCluster):
                 "status": "ok"
             }
         except Exception as e:
+            logger.error(f"[reddit] Failed for '{kw.term}': {e}")
             results[kw.term] = {"status": "error", "detail": str(e)}
 
+    ok_count = sum(1 for v in results.values() if v.get("status") == "ok")
+    logger.info(f"[reddit] Done — {ok_count}/{min(len(body.keywords), 12)} keywords returned data")
     return {"success": True, "results": results}
 
 # ── Step 4: Analyze ────────────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze(body: AnalysisRequest):
+    logger.info(f"[analyze] Starting analysis for: {body.description[:80]}...")
     try:
         trends_data = body.trends_data or {}
         reddit_data = body.reddit_data or {}
+        logger.info(f"[analyze] Received {len(trends_data)} trends entries, {len(reddit_data)} reddit entries")
 
         # Compute correlation matrix from actual time series
         correlation = compute_correlation_matrix(trends_data, body.keywords)
@@ -353,6 +386,7 @@ Just describe what the keyword cluster is collectively pointing at — what beha
         )
         translation_data = parse_json(msg.content[0].text)
 
+        logger.info(f"[analyze] Score: {signal['score']} ({signal['label']}) | Correlation coverage: {correlation.get('coverage', 0)}/{correlation.get('total_keywords', 0)}")
         return {
             "success": True,
             "score": signal["score"],
@@ -363,6 +397,7 @@ Just describe what the keyword cluster is collectively pointing at — what beha
         }
 
     except Exception as e:
+        logger.error(f"[analyze] Failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── Save / fetch signals ───────────────────────────────────────────────────────
@@ -377,16 +412,20 @@ async def save_signal(body: dict):
             "trends_data": body.get("trends_data"),
             "reddit_data": body.get("reddit_data"),
         }).execute()
+        logger.info(f"[save] Signal saved: {result.data[0].get('id', 'unknown')}")
         return {"success": True, "signal": result.data[0]}
     except Exception as e:
+        logger.error(f"[save] Failed to save signal: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/signals")
 async def get_signals():
     try:
         result = supabase.table("signals").select("*").order("created_at", desc=True).execute()
+        logger.info(f"[fetch] Returned {len(result.data)} signals")
         return {"success": True, "signals": result.data}
     except Exception as e:
+        logger.error(f"[fetch] Failed to fetch signals: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/signals/{signal_id}")
